@@ -1,0 +1,702 @@
+---
+title: "Estimation of finite population proportions for small areas – a statistical data integration approach"
+author: "Aditi Sen"
+date: '2024-02-25'
+output: html_document
+---
+
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+getwd()
+```
+
+# Load packages required
+
+```{r setup, include=FALSE}
+library(usmap); library(lme4); library(ggplot2); 
+library(dplyr); library(optimParallel); library(foreach);library(doParallel);
+library(tidyverse); library(maps); library(fastDummies); library(PNWColors); library(purrr); library(survey); library(maps); library(fastDummies);
+library(gganimate); library(ggeasy); library(ggpubr); library(patchwork); 
+```
+
+# Setup parameters like controls for optimParallel to run
+
+```{r }
+if(tolower(.Platform$OS.type) != "windows"){
+  cl <- makeCluster(spec=detectCores(), type="FORK", outfile="")  
+} else
+  cl <- makeCluster(spec=detectCores(), outfile="")
+setDefaultCluster(cl=cl)
+
+options("optimParallel.forward", "optimParallel.loginfo")
+control01 <- list(factr=.01/.Machine$double.eps)
+control001 <- list(factr=.001/.Machine$double.eps)
+control0001 <- list(factr=.0001/.Machine$double.eps)
+```
+
+## Data reading and preparation for PEW, CPS 
+
+```{r }
+data <- readRDS("data.RDS") # read PEW, CPS and actual election data saved in data.RDS
+pew_1 <- data[[1]]; cps_1 <- data[[2]]; actual_result <- data[[3]] 
+
+# function for data preparation: takes dataset as input and creates auxilliary variables like age, race, education for modelling
+
+data_prep <- function(data_name){
+  data_name$ID <- 1:nrow(data_name)
+  data_name$age_new <- ifelse(data_name$age4=="45-64",1,0) # indicator for age group 45-64
+  data_name$age_new <- factor(data_name$age_new, ordered = FALSE) # convert into a factor
+  dummies <-dummy_cols(data_name,select_columns = 'educ4') # create dummy variables for education categories
+  dummies <- dummies %>% rename("educ4_col_grad" = "educ4_col grad")
+  old <- data_name; data_name <- dummies
+  data_name$educ4_col_grad <- factor(data_name$educ4_col_grad, ordered = FALSE) # indicator for education college grad
+  data_name$educ4_postgrad <- factor(data_name$educ4_postgrad, ordered = FALSE) # indicator for education post grad
+  return(data_name)
+}
+
+pew <- data_prep(pew_1); cps <- data_prep(cps_1)
+
+```
+
+# Using glmer function in lme4 package, run mixed effects model and save coefficient estimates
+
+```{r }
+
+logis_fit <- glmer(formula = demvote ~ age_new + gender + race3 + educ4_col_grad + educ4_postgrad + qlogis(obama12) + (1 | state),
+    data = pew, family = "binomial")
+summary(logis_fit)
+intercept <- fixef(logis_fit)[1] # intercept
+age1_coeff <- fixef(logis_fit)[2] # age group 45-64
+gen_fem_coeff <- fixef(logis_fit)[3] # gender female
+race_blk_coeff <- fixef(logis_fit)[4] # race black
+race_hisp_coeff <- fixef(logis_fit)[5] # race hispanic
+edu_colgrad_coeff <- fixef(logis_fit)[6] # education college grad
+edu_postgrad_coeff <- fixef(logis_fit)[7] # education post grad
+obama12coeff <- fixef(logis_fit)[8] # voting percentage for obama
+ran <- as.data.frame(VarCorr(logis_fit)); # random effect 
+ran$sdcor
+
+```
+
+# Calculate x'beta 
+
+```{r,echo=TRUE}
+
+# function takes input dataset and parameter estimates obtained from modelling
+
+x_beta_func <- function(data_name,bhat0,bhat1,bhat2,bhat3,bhat4,bhat5,bhat6,bhat7) {
+  age_cont <- gen_cont <- race_cont <- edu_cont <- obama_cont <- NULL
+# the covariates for model : age, gender, race, education (at unit level), obama % (at area level)
+  age4 <- data_name$age4; gender <- data_name$gender; race3 <- data_name$race3; educ4 <- data_name$educ4 
+  obama12 <- data_name$obama12
+  
+  for (i in 1:nrow(data_name))
+  { # if age variable takes value 45-64 then take beta_1 otherwise 0
+    if(age4[i] == "45-64") { 
+      age_cont[i] <- bhat1 
+    } else { 
+        age_cont[i] <- 0
+    }
+     # if gender variable takes value female then take beta_2 otherwise 0
+    if(gender[i] == "female") { 
+      gen_cont[i] <- bhat2 
+      } else { 
+          gen_cont[i] <- 0
+      } 
+     # if race variable takes value black then take beta_3,  if hispanic then take beta_4 otherwise 0
+    if(race3[i] == "black") { 
+          race_cont[i] <- bhat3 
+          } else if(race3[i] == "hispanic") { 
+            race_cont[i] <- bhat4 
+            } else {
+            race_cont[i] <- 0
+            }
+    # if education variable takes value college grad then take beta_5,  if post grad then take beta_6 otherwise 0
+    if(educ4[i] == "col grad") { 
+      edu_cont[i] <- bhat5 
+      } else if(educ4[i] == "postgrad") { 
+          edu_cont[i] <- bhat6 
+          } else { 
+              edu_cont[i] <- 0 
+                }   
+  }
+  # multiply obama % x value with beta_7
+  obama_cont <- qlogis(obama12)*bhat7
+  
+  # add all the above with intercept to get final x'beta
+  x_beta <- intercept + age_cont + gen_cont + race_cont + edu_cont + obama_cont
+  
+  return(x_beta)
+}
+
+# use above function to get x'beta for PEW and CPS
+pew$x_beta <- x_beta_func(data_name=pew, bhat0=intercept, bhat1=age1_coeff, bhat2=gen_fem_coeff, bhat3=race_blk_coeff, bhat4=race_hisp_coeff, bhat5=edu_colgrad_coeff, bhat6=edu_postgrad_coeff, bhat7=obama12coeff)
+
+cps$x_beta <- x_beta_func(data_name=cps, bhat0=intercept, bhat1=age1_coeff, bhat2=gen_fem_coeff, bhat3=race_blk_coeff, bhat4=race_hisp_coeff, bhat5=edu_colgrad_coeff, bhat6=edu_postgrad_coeff, bhat7=obama12coeff)
+
+```
+
+# Prediction using predict function on glmer model object
+
+```{r, echo = TRUE}
+
+# list of states (pew has 49 and cps has 51 states)
+pew_state_list <- sort(unique(pew$state))
+cps_state_list <- sort(unique(cps$state))
+
+# subset of Montana and SD with only required columns for prediction
+cps_sub <- cps %>% dplyr::select(ID,state,x_beta,age_new, gender, race3, educ4_col_grad, educ4_postgrad, obama12, weight)
+cps_2 <- subset(cps_sub, subset = state %in% c("MT","SD"))
+
+# subset of 49 other states  with only required columns for prediction
+cps_49 <- subset(cps_sub, subset = state %in% pew_state_list)
+
+# calculate the estimated prob from predict function with random effect
+cps_49$pred_prob <- predict(logis_fit, newdata = cps_49, re.form = ~(1|state),
+                            type = "response")
+  
+# without random effect for SD and MT
+cps_2$pred_prob <- predict(logis_fit, newdata = cps_2, re.form = NA, 
+                    type = "response")
+
+# combine all states
+cps_all <- as.data.frame(rbind(cps_49, cps_2))
+cps_all$syn_prob <- predict(logis_fit, newdata = cps_all, re.form = NA, 
+                    type = "response")
+length(unique(cps_all$state))
+
+# list of states
+state_list <- unique(cps_all$state)
+pred_func_results <-  NULL
+
+for(state_name in state_list)
+{
+  data_state <- state_est <-  NULL
+  
+  # subset cps data by state
+  data_state <- subset(cps_all, state == state_name, 
+                       select = c(state, pred_prob, syn_prob, weight))
+  
+  # calculate weighted sum
+  state_est <- c(state_name, 
+                 100*sum(data_state$pred_prob*data_state$weight)/
+                         sum(data_state$weight),
+                 100*sum(data_state$syn_prob*data_state$weight)/
+                         sum(data_state$weight)
+                 )
+  pred_func_results <- rbind(pred_func_results,state_est)
+}
+
+pred_func_results <- as.data.frame(pred_func_results)
+colnames(pred_func_results) <- c("state","pred_est","syn_est")
+rownames(pred_func_results) <- seq(1:51)
+```
+
+
+## User defined function which computes parameter estimates using EM algorithm
+## This can be used on simulated datasets with the required columns names
+
+```{r }
+# function takes dataset and initial values as inputs parameters
+EM_func <- function(input_data,beta_ini,sigma_ini)
+{
+  # set values of other parameters like number of simulations and bounds
+  case_sim=1000;v_lower=-3; v_upper=3;sigma_lower=0;sigma_upper=100;
+  # keep only required variables from datasets to save space
+  input_data <- input_data %>% dplyr::select(state, age4, gender, race3, educ4,obama12, demvote)
+  # list of states
+  state_list <- unique(input_data$state)
+  # create covariates
+  input_data$y <- input_data$demvote
+  input_data$x1 <- ifelse(input_data$age4=="45-64",1,0) #age_new
+  input_data$x2 <- ifelse(input_data$gender=="female",1,0) #gen_fem
+  input_data$x3 <- ifelse(input_data$race3=="black",1,0) #race3black
+  input_data$x4 <- ifelse(input_data$race3=="hispanic",1,0) #race3hispanic
+  input_data$x5 <- ifelse(input_data$educ4=="col grad",1,0) #educ4_col_grad
+  input_data$x6 <- ifelse(input_data$educ4=="postgrad",1,0) #educ4_postgrad
+  input_data$x7 <- qlogis(input_data$obama12) #obama12
+  # drop variables not needed anymore
+  input_data <- subset(input_data, select = -c(age4, gender, race3, educ4,
+                                               obama12, demvote))
+  # split components of initial parameter vector passed into beta0,..,beta7
+  for(i in 1:length(beta_ini)){
+    nam  <- paste0("beta",i-1); assign(nam, beta_ini[i])
+  }
+  
+# Step 1 : create x_beta with initial beta values 
+  
+    input_data$x_beta <- beta0 + input_data$x1*beta1 + input_data$x2*beta2 +
+    input_data$x3*beta3 + input_data$x4*beta4 + input_data$x5*beta5 + 
+    input_data$x6*beta6 + input_data$x7*beta7 
+  
+# Step 2 : Maximize f(vi) for area i
+    
+  # function for defining f(v_i) 
+  vhat_func <- function(state_name) {
+    g_vi <- function(v_i){
+      t <- ((exp(xi_beta + v_i)/(1 + exp(xi_beta + v_i)))^yi)*
+        ((1-exp(xi_beta + v_i)/(1 + exp(xi_beta + v_i)))^(1-yi))
+      return(exp(-(v_i^2)/(2*(sigma_ini^2)))*prod(t))
+    }
+    # filter data for i-th state
+    data_name <- filter(input_data,state==state_name)
+    xi_beta <- data_name$x_beta; yi <- data_name$y; ni <- nrow(data_name)
+    # optimization step with bounds on v_i
+    opt <- optimize(f = g_vi,lower = v_lower,upper = v_upper,maximum = TRUE)
+    # calculate tau_hat_sq with v_i_hat obtained
+    tau_hat_sq <- (1/(sigma_ini^2)+
+                     sum(exp(xi_beta + opt$maximum)/
+                           ((1+exp(xi_beta + opt$maximum))^2)))^(-1)
+    # combined dataset with vi hat and tau i from all areas
+    r <- cbind(as.character(state_name), ni, opt$maximum, tau_hat_sq)
+    res <- rbind(data.frame(), r)
+  }
+  # run function here on the full dataset
+  lap_approx <- data.frame(t(sapply(lapply(state_list, vhat_func),c)))
+  # the final dataset contains state, sample size, v_hat, tau_hat_square
+  colnames(lap_approx) <- c("state","ni","v_hat","tau_hat_sq") 
+  
+# Step 3 : draw for ith area an observation from N (v_i_hat,tau_i_hat_sq) and repeat R = 100 times to get v_i tilde
+  
+  # This function draws random sample from normal and outputs dataset with vi_tilde   
+  vtilde_func <- function(trial) {
+    v_tilde <- as.numeric(lap_approx$v_hat) + 
+      sqrt(as.numeric(lap_approx$tau_hat_sq))*
+      rnorm(n=length(unique(state_list)),mean = 0, sd = 1)
+    r <- cbind(as.character(lap_approx$state),as.numeric(v_tilde))
+    # to return multiple objects
+    out <- list()
+    out$data_set <- rbind(data.frame(), r)
+    out$n_v_sq <- sum((v_tilde^2)*as.numeric(lap_approx$ni))
+    return(out)
+  }
+  vtilde_out <- lapply(1:case_sim, vtilde_func)
+  # extract objects from list
+  n_v_sq <- lapply(vtilde_out, '[[',2)
+  v_case_sim <- lapply(vtilde_out, '[[',1)
+  v_case_sim <- lapply(v_case_sim, setNames, c("state","v_tilde"))
+  
+  # Step 4: Write Q function to maximize
+  
+  # function to maximize for sigma
+  Q_theta_sigma <- function(sigma_sq){
+    return(log(sigma_sq)-(nrow(input_data)/2)*log(sigma_sq)-
+             mean(unlist(n_v_sq))/(2*sigma_sq))
+  }
+  Q_theta_sigma <- Vectorize(Q_theta_sigma)
+  #curve(Q_theta_sigma, xlim = c(0,10000))
+  # optimize here
+  opt_sigma <- optimize(f = Q_theta_sigma, 
+                        lower = sigma_lower, upper = sigma_upper, 
+                        tol = 0.0001, maximum = TRUE)
+
+  # function to optimize for beta
+  h2_beta <- function(beta){
+    # components of beta
+    for(i in 1:length(beta_ini)){
+      nam  <- paste0("b",i-1); assign(nam, beta[i])
+    }
+    NewVar <- function(r) { 
+      vr <- v_case_sim[[r]]
+      newvar2 <- function(state_name){
+        data_name <- input_data[input_data$state==state_name,]
+        vri <- as.numeric(vr[vr$state==state_name,]$v_tilde)
+        # (CHANGE HERE)
+        xb <- b0 + data_name$x1*b1 + data_name$x2*b2 + data_name$x3*b3 +
+          data_name$x4*b4 + data_name$x5*b5 + data_name$x6*b6 + 
+          data_name$x7*b7
+        ti <- -data_name$y*log(exp(xb + vri)/(1 + exp(xb + vri)))+
+          (1-data_name$y)*log(1 + exp(xb + vri))
+        return(sum(ti,na.rm = TRUE))
+      }
+      return(sum(sapply(state_list,newvar2)))
+    }
+    tot <- sapply(1:case_sim,NewVar)
+    return(mean(tot))
+  }
+  # optimize here using optimParallel
+  opt_beta <- optimParallel(par=beta_ini, fn = h2_beta,control=control001)
+  # The output of this EM function is a list containing beta_hat and sigma_hat and vi sample values
+  EM_out <- list()
+  EM_out$beta_hat <- opt_beta$par
+  EM_out$sigma_hat <- round(sqrt(opt_sigma$maximum),4)
+  #EM_out$v_case_sim <- v_case_sim
+  return(EM_out)
+}
+
+```
+
+
+## Run algorithm on PEW data to get parameter estimates
+
+```{r }
+sigma <- 0.1 # initial sigma
+for(i in 1:8){ nam  <- paste0("beta",i-1); assign(nam, 0.1)} # initial beta values
+# note the start time of the algorithm
+EM_start_time <- Sys.time()
+# run algorithm iteratively here until convergence i.e. absolute difference between iterations < 0.01
+for(k in 1:1000){
+  sigmaOld <- sigma 
+  for(j in 1:8){
+    nam1 <- paste0("beta",j-1,"old"); nam2 <- paste0("beta",j-1)
+    assign(nam1,get(nam2))
+  }
+    ## update
+    f_value <- EM_func(input_data = pew,
+                       sigma_ini=sigma,
+                       beta_ini=c(beta0,beta1,beta2,
+                                  beta3,beta4,beta5,
+                                  beta6,beta7))
+    # get sigma
+    sigma <- round(f_value$sigma_hat,4)
+    # get beta
+    b <- round(f_value$beta_hat,4)
+    # assign updated values
+    for(j in 1:8){
+      nam  <- paste0("beta",j-1); assign(nam, as.numeric(b[j]))
+    }
+    # condition for convergence
+    if(abs(sigma - sigmaOld) < 0.01 & abs(beta0 - beta0old) < 0.01 & 
+       abs(beta1 - beta1old) < 0.01 & abs(beta2 - beta2old) < 0.01 &
+       abs(beta3 - beta3old) < 0.01 & abs(beta4 - beta4old) < 0.01 &
+       abs(beta5 - beta5old) < 0.01 & abs(beta6 - beta6old) < 0.01 &
+       abs(beta7 - beta7old) < 0.01) {
+        EM_end_time <- Sys.time()
+        print(EM_end_time - EM_start_time)
+        break
+    }
+  }
+  # function ends here
+
+# print final values 
+print(paste0("EM algorithm total iterations:",k))
+print(paste0("EM estimates: ","Sigma: ",sigma,
+               ", Beta0: ",beta0,", Beta1: ",beta1,
+               ", Beta2: ",beta2,", Beta3: ",beta3,
+               ", Beta4: ",beta4,", Beta5: ",beta5,
+               ", Beta6: ",beta6,", Beta7: ",beta7)) 
+
+```
+
+## Calculate EBP at state level
+
+```{r }
+# calculate x'beta with new EM parameter estimates
+cps$x_beta_EM <- x_beta_func(data_name = cps, 
+                           bhat0=beta0, bhat1=beta1, bhat2=beta2, bhat3=beta3, bhat4=beta4, bhat5=beta5, bhat6=beta6, bhat7=beta7)
+  
+# calculate probability and generate y
+# cps$yij_ebp <- exp(x_beta_EM)/(1+exp(x_beta_EM))
+case_sim = 100; v_case_sim <- f_value$v_case_sim  
+# function to calculate yij ebp with vi sample values
+f1 <- function(state_name){
+    data_name <- cps[cps$state==state_name,]
+    xb <- data_name$x_beta_EM
+    f2 <- function(r){
+      vr <- v_case_sim[[r]]
+      vri <- as.numeric(vr[vr$state==state_name,]$v_tilde)
+      ti <- exp(xb + vri)/(1 + exp(xb + vri))
+    }
+    chk <- apply(sapply(1:case_sim,f2),1,mean)
+    r <- cbind(as.character(state_name),chk,data_name$weight)
+    res <- rbind(data.frame(), r)
+  }
+
+chk_yij_ebp <- do.call(rbind, lapply(pew_state_list, f1))
+colnames(chk_yij_ebp) <- c("state","yij_ebp","weight")
+# For MT, SD there is no vi, so do these separately with vi = 0
+cps_MTSD <- cps[cps$state %in% c("MT","SD"),c("state","x_beta_EM","weight")]
+cps_MTSD$yij_ebp <- exp(cps_MTSD$x_beta_EM)/(1 + exp(cps_MTSD$x_beta_EM))
+chk_yij_ebp2 <- rbind(chk_yij_ebp,cps_MTSD[,c("state","yij_ebp","weight")])
+    
+area_level_stat <- function(state_name,data_name)
+  {
+    # subset data_b by state
+    data_state <- filter(data_name,state==state_name)
+    # calculate weighted sum
+    state_est <- round(100*sum(as.numeric(data_state$yij_ebp)*
+                                 as.numeric(data_state$weight)) / 
+                         sum(as.numeric(data_state$weight)),4)
+    all_state_est <- cbind(as.character(state_name),state_est)
+    res <- rbind(data.frame(), all_state_est)
+    return(res)
+  }
+  
+# apply above function on CPS to get EBP Yi bar using new EM parameter estimates
+EM_EBP_est <- bind_rows(lapply(cps_state_list, area_level_stat, data_name=chk_yij_ebp2))
+colnames(EM_EBP_est) <- c("state","EM_est")
+
+```
+
+# Calculate direct estimates from PEW data and compare with actuals
+
+```{r }
+d_design <- svydesign(id=~ID, weights=~weight, data=pew)
+direct_est <- as.data.frame(svyby(~demvote,~state,design=d_design, 
+                                   FUN = svymean, keep.names = FALSE, 
+                                   na.rm = TRUE, covmat = TRUE))
+direct_est$direct <- 100*direct_est$demvote
+direct_est <- select(direct_est,-c("demvote","se"))
+
+df_list <- list(actual_result, direct_est, pred_func_results, EM_EBP_est)
+
+#merge all data frames in list
+comp_data <- df_list %>% reduce(full_join, by='state')
+comp_data_49 <- subset(comp_data, subset = state %in% pew_state_list)
+# convert columns to numeric
+comp_data <- comp_data %>% mutate_at(c('actual', 'direct','EM_est'), as.numeric)
+
+write.csv(comp_data,"comp_data.csv")
+
+```
+
+
+# Summary measures : ASD, RASD, AAD
+
+```{r,echo=TRUE}
+
+# Average Squared Deviation (ASD)
+asd <- function(est, act) (mean((est - act)^2, na.rm = TRUE))
+#  EBP estimate vs actual
+print(paste0("ASD EBP Est vs Act is ", 
+             round(asd(comp_data$EM_est, comp_data$actual),2)))
+# direct vs actual
+print(paste0("ASD Direct Est vs Act is ",
+             round(asd(comp_data_49$direct, comp_data_49$actual),2)))
+
+
+# square root of ASD (i.e., RASD)
+rasd <- function(est, act) sqrt(mean((est - act)^2, na.rm = TRUE))
+#  estimate vs actual
+print(paste0("RASD EBP Est vs Act is ", 
+             round(rasd(comp_data$EM_est, comp_data$actual),2)))
+# direct vs actual
+print(paste0("RASD Direct Est vs Act is ",
+             round(rasd(comp_data_49$direct, comp_data_49$actual),2)))
+
+
+
+# Average Absolute Deviation (AAD), where you replace the squared deviation by absolute deviation
+aad <- function(est, act) mean(abs(est - act))
+#  estimate vs actual
+print(paste0("AAD EBP Est vs Act is ", 
+             round(aad(comp_data$EM_est, comp_data$actual),2)))
+# direct vs actual
+print(paste0("AAD Direct Est vs Act is ",
+             round(aad(comp_data_49$direct, comp_data_49$actual),2)))
+
+```
+# Create US maps
+
+```{r }
+pal <- pnw_palette("Bay", n=100, type="continuous")
+
+# Map of actual
+plot_act <- plot_usmap(data = comp_data, values = "actual", labels=FALSE) + scale_fill_gradientn(colours = pal, name = "% voters", limits = c(0,96)) + easy_move_legend(to = c("right")) + labs(title = "Actual % voters for Clinton in 2016 election") + theme(panel.background = element_rect(colour = "black")) + theme(plot.title = element_text(hjust = 0.5))
+plot_act
+# save the plot
+#ggsave("actual_usa.png",plot = last_plot(), bg = "white")
+
+# Map of direct estimates
+plot_direct <- plot_usmap(data = comp_data, values = "direct", labels=FALSE, include = pew_state_list, show.legend = FALSE) + scale_fill_gradientn(colours = pal, limits = c(0,96)) + labs(title = "Direct Estimate") + theme(panel.background = element_rect(colour = "black")) + theme(plot.title = element_text(hjust = 0.5))
+
+# Map of EBP estimates
+plot_EBP <- plot_usmap(data = comp_data, values = "EM_est", labels=FALSE, show.legend = FALSE) + scale_fill_gradientn(colours = pal, limits = c(0,96)) + labs(title = "EBP") + theme(panel.background = element_rect(colour = "black")) + theme(plot.title = element_text(hjust = 0.5))
+
+figure <- ggarrange(plot_direct, plot_EBP,
+#                    labels = c("Direct Estimate", "EBP"),
+                    ncol = 2, nrow = 1)
+figure
+# save the plot
+#ggsave("direct_EBP_usa.png",plot = last_plot(), bg = "white")
+
+```
+
+
+#==========================================================================================
+
+## Write bootstrap function for MSPE
+
+```{r }
+
+boot_func <- function(bt){
+  print(paste0("start of bootstrap ",bt))
+  
+  data_pew_b <-data_cps_b<- NULL
+  
+  ## Step 1 : Subroutine to generate bootstrap data from any dataset
+  # function which generates y for each state
+  state_func <- function(state_name,data_name) {
+    data_state <- data_bi <- demvote <- theta_bi <- v_bi <- NULL
+    # subset data by state
+    data_state <- filter(data_name,state==state_name)
+    # draw from N(0, sigma_hat_sq) where sigma_hat_sq is from model summary
+    v_bi <- rnorm(n = 1, mean = 0, sd = ran$sdcor)
+    # define prob theta
+    theta_bi <- exp(data_state$x_beta + v_bi)/
+        (1 + exp(data_state$x_beta + v_bi))
+    # draw an observation from Bern with probability theta
+    bern_samp <- function(prob){
+      rbinom(n = 1, size = 1, prob)
+    }
+    demvote <- sapply(theta_bi, bern_samp)
+    # create combined data for state i
+    data_bi <- cbind(demvote,data_state[,c("state","age4","gender","race3","educ4","obama12","weight")])
+    # return bootstrap data for state i
+    res <- rbind(data.frame(), data_bi)
+    return(res)
+  }
+  
+  ## Step 2 : Generate PEW bootstrap sample using above function
+  data_pew_b <- bind_rows(lapply(pew_state_list, state_func, data_name=pew))
+  print(sum(data_pew_b$demvote))
+  
+  # run glmer function on PEW Bootstrap sample (not for analysis but for comparison of estimates)
+  data_pew_b$x1 <- ifelse(data_pew_b$age4=="45-64",1,0) #age_new
+  data_pew_b$x2 <- ifelse(data_pew_b$gender=="female",1,0) #gen_fem
+  data_pew_b$x3 <- ifelse(data_pew_b$race3=="black",1,0) #race3black
+  data_pew_b$x4 <- ifelse(data_pew_b$race3=="hispanic",1,0) #race3hispanic
+  data_pew_b$x5 <- ifelse(data_pew_b$educ4=="col grad",1,0) #educ4_col_grad
+  data_pew_b$x6 <- ifelse(data_pew_b$educ4=="postgrad",1,0) #educ4_postgrad
+  data_pew_b$x7 <- qlogis(data_pew_b$obama12) #obama12
+  
+  logis_fit_boot <- glmer(formula = demvote ~ x1 + x2 + x3 + x4 + x5 + x6 + x7 + (1 | state), data = data_pew_b, family = "binomial") 
+  print(paste0("GLMER SD: ",
+               round(attributes(VarCorr(logis_fit_boot)$state)$stddev,4)))
+  print("GLMER beta: ")
+  print(round(fixef(logis_fit_boot),4))
+
+  ## Step 3 : Run function for EM algorithm on PEW Bootstrap sample to get parameter estimates
+  
+  sigma <- 0.1 # initial sigma
+  for(i in 1:8){ nam  <- paste0("beta",i-1); assign(nam, 0.1)} # initial beta values
+  # note the start time of the algorithm
+  EM_start_time <- Sys.time()
+  # run algorithm iteratively here until convergence i.e. absolute difference between iterations < 0.01
+  for(k in 1:1000){
+  sigmaOld <- sigma 
+  for(j in 1:8){
+    nam1 <- paste0("beta",j-1,"old"); nam2 <- paste0("beta",j-1)
+    assign(nam1,get(nam2))
+  }
+    ## update
+    f_value <- EM_func(input_data = data_pew_b,
+                       sigma_ini=sigma,
+                       beta_ini=c(beta0,beta1,beta2,
+                                  beta3,beta4,beta5,
+                                  beta6,beta7))
+    # get sigma
+    sigma <- round(f_value$sigma_hat,4)
+    # get beta
+    b <- round(f_value$beta_hat,4)
+    # assign updated values
+    for(j in 1:8){
+      nam  <- paste0("beta",j-1); assign(nam, as.numeric(b[j]))
+    }
+    # condition for convergence
+    if(abs(sigma - sigmaOld) < 0.01 & abs(beta0 - beta0old) < 0.01 & 
+       abs(beta1 - beta1old) < 0.01 & abs(beta2 - beta2old) < 0.01 &
+       abs(beta3 - beta3old) < 0.01 & abs(beta4 - beta4old) < 0.01 &
+       abs(beta5 - beta5old) < 0.01 & abs(beta6 - beta6old) < 0.01 &
+       abs(beta7 - beta7old) < 0.01) {
+        EM_end_time <- Sys.time()
+        print(EM_end_time - EM_start_time)
+        break
+    }
+  }
+  # function ends here
+  # print final values 
+  print(paste0("EM algorithm total iterations:",k))
+  print(paste0("EM estimates: ","Sigma: ",sigma,
+               ", Beta0: ",beta0,", Beta1: ",beta1,
+               ", Beta2: ",beta2,", Beta3: ",beta3,
+               ", Beta4: ",beta4,", Beta5: ",beta5,
+               ", Beta6: ",beta6,", Beta7: ",beta7)) 
+
+  # calculate x'beta with new EM parameter estimates
+  x_beta_EM <- x_beta_func(data_name = cps, 
+                           bhat0=beta0, bhat1=beta1, bhat2=beta2, bhat3=beta3, bhat4=beta4, bhat5=beta5, bhat6=beta6, bhat7=beta7)
+  # calculate probability
+  cps$yij_ebp_b <- exp(x_beta_EM)/(1+exp(x_beta_EM))
+  
+  ## Step 4: function to calculate weighted estimate at area level
+    area_level_stat <- function(state_name,data_name)
+  {
+    # subset data_b by state
+    data_state <- filter(data_name,state==state_name)
+    # calculate weighted sum
+    state_est <- round(100*sum(data_state$yij_ebp_b*data_state$weight) / sum(data_state$weight),4)
+    all_state_est <- cbind(as.character(state_name),state_est)
+    res <- rbind(data.frame(), all_state_est)
+    return(res)
+  }
+  
+  ## Step 5: apply above function on CPS to get EBP Yi bar using new EM parameter estimates
+  
+  stat_est_b <- bind_rows(lapply(cps_state_list, area_level_stat, data_name=cps))
+  
+  # This was the estimated value for MSPE. Next we do true value i.e. assuming model is true.
+
+  ## Step 6: generate CPS bootstrap sample using function as before
+ 
+  data_cps_b <- bind_rows(lapply(cps_state_list, state_func, data_name=cps))
+  print(sum(data_cps_b$demvote))
+  data_cps_b <- data_cps_b %>% rename("yij_ebp_b"="demvote")
+
+  ## Step 7: apply function on CPS to get EBP Yi bar
+  
+  stat_true_b <- bind_rows(lapply(cps_state_list, area_level_stat, data_name = data_cps_b))
+  
+  # This was the true value i.e. assuming model is true.
+  
+  boot_out <- list()
+  # Store true and estimated value for MSPE calculation
+  boot_out$stat_est_b <- stat_est_b
+  boot_out$stat_true_b <- stat_true_b
+  
+  # Store EM estimates
+  boot_out$EM_est <- data.frame(sigma = sigma, Beta0 = beta0, Beta1 = beta1, Beta2 = beta2, Beta3 = beta3, Beta4 = beta4, Beta5 = beta5, Beta6 = beta6, Beta7 = beta7)
+  
+  # Store GLMER estimates
+  logis_est <- round(fixef(logis_fit_boot),4)
+  boot_out$GLMER_est <- data.frame(sigma = round(attributes(VarCorr(logis_fit_boot)$state)$stddev,4),
+  Beta0 = logis_est[1], Beta1 = logis_est[2], Beta2 = logis_est[3], Beta3 = logis_est[4], Beta4 = logis_est[5], Beta5 = logis_est[6], Beta6 = logis_est[7], Beta7 = logis_est[8])
+  
+  return(boot_out)
+}
+
+# function for bootstrap ends here
+
+```
+
+# Run bootstrap function assigning number of bootstraps B
+
+```{r }
+
+B <- 500
+
+boot_start_time <- Sys.time()
+boot_result <- lapply(1:B,boot_func)
+boot_end_time <- Sys.time()
+print(paste0("Bootstrap time: ",boot_end_time - boot_start_time))
+
+```
+
+# Calculate MSPE with formula as mean of the values (true-est)^2
+
+```{r }
+# extract objects from list
+est_val <- data.frame(lapply(boot_result, '[[',1)) # estimated value
+true_val <- data.frame(lapply(boot_result, '[[',2)) # true value
+# convert to numeric
+est_new <- est_val[,seq(2,ncol(est_val),2)] %>% mutate_if(is.character, as.numeric)
+true_new <- true_val[,seq(2,ncol(true_val),2)] %>% mutate_if(is.character, as.numeric)
+
+write_csv(cbind(est_val[,1],est_new),"boot_est_500.csv")
+write_csv(cbind(true_val[,1],true_new),"boot_true_500.csv")
+
+MSPE <- (est_new - true_new)^2
+final_MSPE <- cbind(est_val[,1],rowMeans(MSPE))  
+
+```
