@@ -321,7 +321,7 @@ EM_func <- function(input_data,beta_ini,sigma_ini)
   EM_out <- list()
   EM_out$beta_hat <- opt_beta$par
   EM_out$sigma_hat <- round(sqrt(opt_sigma$maximum),4)
-  #EM_out$v_case_sim <- v_case_sim
+  EM_out$v_case_sim <- v_case_sim
   return(EM_out)
 }
 
